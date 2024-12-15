@@ -43,19 +43,46 @@
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 
-// Script-related globals
-std::vector<String> scriptFileNames; // no fixed size needed
-int scriptCurrentFileIndex = 0;
-long scriptOldPosition = -999;
-
+// Globals
 WebServer server(80);
 DNSServer dnsServer;
+Preferences preferences;
+USBHIDKeyboard Keyboard;
+
 const byte DNS_PORT = 53;
 
 String ssid = "Semi-Evil-M5Dial";
 const char* password = "";
 
-// Main menu items
+std::vector<String> ssidList;
+std::vector<std::string> whitelist = {"neighbours-box", "7h30th3r0n3", "Evil-M5Core2"};
+
+int currentIndex = 0;
+long oldPosition = -999;
+bool isPortalRunning = false;
+unsigned long lastPressTime = 0;
+const int encoderMoveThreshold = 4;
+const unsigned long doublePressThreshold = 500;
+
+int screenBrightness = 128;  // Global brightness
+bool debugMode = true;       // true = Normal (debug) mode, false = HID mode
+bool verboseDebug = false;
+bool pendingReset = false;
+String pendingFile = "";
+
+// For Karma Attack
+bool isKarmaRunning = false;
+bool isAutoKarmaActive = false;
+bool newSSIDAvailable = false;
+bool isAPDeploying = false;
+char lastSSID[33] = {0};
+char lastDeployedSSID[33] = {0};
+unsigned long lastProbeDisplayUpdate = 0;
+int probeDisplayState = 0;
+const int autoKarmaAPDuration = 20000;
+const int maxSSIDs = 100;
+
+// Menu items
 const char* menuItems[] = {
     "Start Portal",
     "Saved SSID",
@@ -66,17 +93,16 @@ const char* menuItems[] = {
 };
 const int menuItemsCount = sizeof(menuItems) / sizeof(menuItems[0]);
 
-// Settings items count including Verbose Debug
-int settingsItemsCount = 5;
+// Settings menu items (dynamic)
+int settingsItemsCount = 5; 
 
-std::vector<String> ssidList;
-std::vector<std::string> whitelist = {"neighbours-box", "7h30th3r0n3", "Evil-M5Core2"};
+// Script-related globals
+std::vector<String> scriptFileNames;
+int scriptCurrentFileIndex = 0;
+long scriptOldPosition = -999;
 
-int currentIndex = 0;
-long oldPosition = -999;
-bool isPortalRunning = false;
-unsigned long lastPressTime = 0;
-const int encoderMoveThreshold = 4;
+const float defaultTextSize = 0.4;
+uint8_t display_rotation = 0;
 
 enum ScreenState {
     MENU_SCREEN,
@@ -88,28 +114,23 @@ enum ScreenState {
 };
 ScreenState currentScreen = MENU_SCREEN;
 
-bool isKarmaRunning = false;
-bool isAutoKarmaActive = false;
-bool newSSIDAvailable = false;
-bool isAPDeploying = false;
-char lastSSID[33] = {0};
-char lastDeployedSSID[33] = {0};
-unsigned long lastProbeDisplayUpdate = 0;
-int probeDisplayState = 0;
-const int autoKarmaAPDuration = 20000;
-const int maxSSIDs = 100;
-const float defaultTextSize = 0.4;
+enum DisplayState {
+    DISPLAY_NONE,
+    DISPLAY_WAITING_FOR_PROBE,
+    DISPLAY_AP_STATUS
+};
+DisplayState currentDisplayState = DISPLAY_NONE;
 
-Preferences preferences;
-int screenBrightness = 128;  // Global brightness
-bool debugMode = false;      // true = Debug mode, false = HID mode
-bool verboseDebug = false;   // true = verbose logs, false = minimal logs
-bool pendingReset = false; 
-String pendingFile = "";
+// Forward declarations
+void drawMenu(int index);
+void returnToMainMenu();
+void stopAutoKarma();
+void autoKarmaPacketSniffer(void* buf, wifi_promiscuous_pkt_type_t type);
+void displayAPStatus(const char* ssid, unsigned long startTime, int autoKarmaAPDuration);
+void readFileToSerial(fs::FS &fs, const char *path);
+void executeKeystrokes(const char *filename);
 
-// HID Keyboard
-USBHIDKeyboard Keyboard;
-
+// Toggle Debug/HID Mode
 void toggleMode() {
     debugMode = !debugMode;
     if (!preferences.begin("settings", false)) {
@@ -142,11 +163,10 @@ void setup() {
         debugMode = true;
         verboseDebug = true; // default if fail
     } else {
-        debugMode = preferences.getBool("debugMode", false);
+        debugMode = preferences.getBool("debugMode", true);
         verboseDebug = preferences.getBool("verboseDebug", false);
         pendingReset = preferences.getBool("pendingReset", false);
         pendingFile = preferences.getString("pendingFile", "");
-        // Restore screen brightness from Preferences if available
         screenBrightness = preferences.getInt("brightness", 128);
         preferences.end();
     }
@@ -163,7 +183,6 @@ void setup() {
     }
 
     if (pendingReset) {
-        // Clear pending reset and restart
         if (preferences.begin("settings", false)) {
             preferences.remove("pendingReset");
             preferences.end();
@@ -171,8 +190,8 @@ void setup() {
         esp_restart();
     }
 
+    // If in HID mode, initialize Keyboard
     if (!debugMode) {
-        // HID Mode
         M5Dial.Display.drawString("BadUSB Mode", M5Dial.Display.width() / 2, M5Dial.Display.height() / 2);
         Keyboard.begin();
         USB.begin();
@@ -181,7 +200,7 @@ void setup() {
         if (!pendingFile.isEmpty()) {
             M5Dial.Display.clear();
             M5Dial.Display.drawString("Executing Pending File...", M5Dial.Display.width() / 2, M5Dial.Display.height() / 2);
-            delay(5000); 
+            delay(5000);
             executeKeystrokes(pendingFile.c_str());
             if (preferences.begin("settings", false)) {
                 preferences.remove("pendingFile");
@@ -189,6 +208,7 @@ void setup() {
             }
             M5Dial.Display.drawString("Execution Done", M5Dial.Display.width() / 2, (M5Dial.Display.height() / 2) + 40);
             delay(2000);
+            // After executing pending file, just return.
             return;
         }
     } else {
@@ -196,12 +216,59 @@ void setup() {
         M5Dial.Display.drawString("Normal Mode", M5Dial.Display.width() / 2, M5Dial.Display.height() / 2);
     }
 
-    String selectedSSID = loadSelectedSSID();
-    if (!selectedSSID.isEmpty()) {
-        ssid = selectedSSID;
-        if (verboseDebug) Serial.println("Loaded selected SSID: " + ssid);
+    // Display image if exists
+    const char* imagePath = "/EvilM5hub-240-135px.bmp";
+    if (SPIFFS.exists(imagePath)) {
+        Serial.println("Image file found, displaying image.");
+
+        int16_t x_center1 = (M5Dial.Display.width() - 240) / 2;
+        int16_t y_center1 = (M5Dial.Display.height() - 135) / 2;
+
+        M5Dial.Display.setRotation(display_rotation);
+        M5Dial.Display.clear();
+        M5Dial.Display.drawBmpFile(SPIFFS, imagePath, x_center1, y_center1);
+        delay(5000);
+        M5Dial.Display.clear();
+    } else {
+        Serial.println("Image file not found, skipping image display.");
     }
-    loadSSIDs();
+
+    // Load selected SSID
+    {
+        File file = SPIFFS.open("/selectedSSID.json", "r");
+        if (file) {
+            StaticJsonDocument<256> doc;
+            DeserializationError error = deserializeJson(doc, file);
+            if (!error) {
+                String selectedSSID = doc["selectedSSID"].as<String>();
+                if (!selectedSSID.isEmpty()) {
+                    ssid = selectedSSID;
+                    if (verboseDebug) Serial.println("Loaded selected SSID: " + ssid);
+                }
+            }
+            file.close();
+        }
+    }
+
+    // Load SSIDs
+    {
+        File file = SPIFFS.open("/SSID.json", "r");
+        if (file) {
+            StaticJsonDocument<1024> doc;
+            DeserializationError error = deserializeJson(doc, file);
+            if (!error) {
+                ssidList.clear();
+                for (JsonVariant v : doc["ssids"].as<JsonArray>()) {
+                    String s = v.as<String>();
+                    ssidList.push_back(s);
+                }
+                if (debugMode && verboseDebug) {
+                    Serial.printf("Total SSIDs loaded: %d\n", ssidList.size());
+                }
+            }
+            file.close();
+        }
+    }
 
     M5Dial.Display.fillScreen(BLACK);
     drawMenu(currentIndex);
@@ -213,81 +280,86 @@ void loop() {
 
     switch (currentScreen) {
         case MENU_SCREEN:
-            handleMenuNavigation(newPosition);
-            break;
+        {
+            if (abs(newPosition - oldPosition) >= encoderMoveThreshold) {
+                M5Dial.Speaker.tone(8000, 20);
+                oldPosition = newPosition;
+                currentIndex = (newPosition / encoderMoveThreshold + menuItemsCount) % menuItemsCount;
+                if (currentIndex < 0) {
+                    currentIndex += menuItemsCount;
+                }
+                if (debugMode && verboseDebug) {
+                    Serial.printf("Navigating main menu, index: %d\n", currentIndex);
+                }
+                drawMenu(currentIndex);
+            }
+
+            static unsigned long pressStartTime = 0;
+            static bool isBtnAPressed = false;
+            if (M5Dial.BtnA.wasPressed()) {
+                isBtnAPressed = true;
+                pressStartTime = millis();
+            }
+            if (isBtnAPressed && M5Dial.BtnA.wasReleased()) {
+                unsigned long pressDuration = millis() - pressStartTime;
+                isBtnAPressed = false;
+                if (pressDuration < 1000) {
+                    switch (currentIndex) {
+                        case 0: // Start Portal
+                            if (debugMode && !isPortalRunning) startCaptivePortal();
+                            break;
+                        case 1: // Saved SSID
+                            if (debugMode && !ssidList.empty()) selectSSID();
+                            break;
+                        case 2: // Start Karma
+                            if (debugMode && !isKarmaRunning) startAutoKarma();
+                            break;
+                        case 3: // BadUSB
+                            currentScreen = EXECUTE_SCRIPT_SCREEN;
+                            enterExecuteScriptScreen();
+                            break;
+                        case 4: // About
+                            currentScreen = ABOUT_SCREEN;
+                            displayAboutScreen();
+                            break;
+                        case 5: // Settings
+                            currentScreen = SETTINGS_SCREEN;
+                            drawSettingsMenu(0);
+                            break;
+                    }
+                }
+            }
+        }
+        break;
+
         case PORTAL_SCREEN:
             if (debugMode) handlePortalScreen();
             break;
+
         case KARMA_SCREEN:
             if (debugMode) loopAutoKarma();
             break;
+
         case EXECUTE_SCRIPT_SCREEN:
             handleExecuteScriptScreen();
             break;
+
         case ABOUT_SCREEN:
             if (M5Dial.BtnA.wasPressed()) {
                 currentScreen = MENU_SCREEN;
                 drawMenu(currentIndex);
             }
             break;
+
         case SETTINGS_SCREEN:
             handleSettingsScreen(newPosition);
             break;
     }
+
     delay(10);
 }
 
-void handleMenuNavigation(long newPosition) {
-    if (abs(newPosition - oldPosition) >= encoderMoveThreshold) {
-        M5Dial.Speaker.tone(8000, 20);
-        oldPosition = newPosition;
-        currentIndex = (newPosition / encoderMoveThreshold + menuItemsCount) % menuItemsCount;
-        if (currentIndex < 0) {
-            currentIndex += menuItemsCount;
-        }
-        if (debugMode && verboseDebug) {
-            Serial.printf("Navigating main menu, index: %d\n", currentIndex);
-        }
-        drawMenu(currentIndex);
-    }
-
-    static unsigned long pressStartTime = 0;
-    static bool isBtnAPressed = false;
-    if (M5Dial.BtnA.wasPressed()) {
-        isBtnAPressed = true;
-        pressStartTime = millis();
-    }
-    if (isBtnAPressed && M5Dial.BtnA.wasReleased()) {
-        unsigned long pressDuration = millis() - pressStartTime;
-        isBtnAPressed = false;
-        if (pressDuration < 1000) {
-            switch (currentIndex) {
-                case 0: // Start Portal
-                    if (debugMode && !isPortalRunning) startCaptivePortal();
-                    break;
-                case 1: // Saved SSID
-                    if (debugMode && !ssidList.empty()) selectSSID();
-                    break;
-                case 2: // Start Karma
-                    if (debugMode && !isKarmaRunning) startAutoKarma();
-                    break;
-                case 3: // BadUSB
-                    currentScreen = EXECUTE_SCRIPT_SCREEN;
-                    enterExecuteScriptScreen();
-                    break;
-                case 4: // About
-                    currentScreen = ABOUT_SCREEN;
-                    displayAboutScreen();
-                    break;
-                case 5: // Settings
-                    currentScreen = SETTINGS_SCREEN;
-                    drawSettingsMenu(0);
-                    break;
-            }
-        }
-    }
-}
-
+// Drawing Menus
 void drawMenu(int index) {
     if (index < 0 || index >= menuItemsCount) {
         index = 0;
@@ -300,7 +372,7 @@ void drawListMenu(const char* items[], int itemCount, int index, uint16_t highli
     drawRing(ringColor);
 
     const int itemHeight = 25;
-    const int numVisibleItems = 4;
+    const int numVisibleItems = 4; // show more items for clarity
 
     for (int i = 0; i < numVisibleItems; i++) {
         int itemIndex = (index + i - 1 + itemCount) % itemCount;
@@ -322,18 +394,26 @@ void drawListMenu(const char* items[], int itemCount, int index, uint16_t highli
     }
 }
 
-void drawSettingsMenu(int index) {
-    String toggleModeText = debugMode ? "Toggle BadUSB Mode" : "Toggle Normal Mode";
-    const char* settingsItemsDynamic[5] = {
-        "Power Off",
-        "Screen Brightness",
-        toggleModeText.c_str(),
-        verboseDebug ? "Verbose Debug: On" : "Verbose Debug: Off",
-        "Back"
-    };
-    drawListMenu(settingsItemsDynamic, settingsItemsCount, index, PURPLE, WHITE, PURPLE);
+void drawRing(uint16_t color) {
+    int16_t centerX = M5Dial.Display.width() / 2;
+    int16_t centerY = M5Dial.Display.height() / 2;
+    int16_t radius = min(M5Dial.Display.width(), M5Dial.Display.height()) / 2;
+
+    for (int16_t r = radius; r > radius - 10; r--) {
+        M5Dial.Display.drawCircle(centerX, centerY, r, color);
+    }
 }
 
+// Utility function to center text on the display with a vertical offset
+void centerText(const String &text, int16_t yOffset = 0) {
+    int16_t textWidth = M5Dial.Display.textWidth(text);
+    int16_t x = (M5Dial.Display.width() - textWidth) / 2;
+    int16_t y = (M5Dial.Display.height() / 2) + yOffset;
+    M5Dial.Display.setCursor(x, y);
+    M5Dial.Display.println(text);
+}
+
+// About Screen
 void displayAboutScreen() {
     M5Dial.Display.clear();
     drawRing(TFT_ORANGE);
@@ -373,30 +453,7 @@ void displayAboutScreen() {
     M5Dial.Display.println("Press to return to menu");
 }
 
-void loadSSIDs() {
-    File file = SPIFFS.open("/SSID.json", "r");
-    if (!file) {
-        return;
-    }
-
-    StaticJsonDocument<1024> doc;
-    DeserializationError error = deserializeJson(doc, file);
-    if (error && verboseDebug) {
-        Serial.println("Failed to parse SSID.json");
-    }
-
-    ssidList.clear();
-    for (JsonVariant v : doc["ssids"].as<JsonArray>()) {
-        String s = v.as<String>();
-        ssidList.push_back(s);
-    }
-
-    file.close();
-    if (debugMode && verboseDebug) {
-        Serial.printf("Total SSIDs loaded: %d\n", ssidList.size());
-    }
-}
-
+// SSID Handling
 void saveSSID(const String& newSSID) {
     for (const auto& s : ssidList) {
         if (s == newSSID) return;
@@ -453,119 +510,16 @@ void saveSelectedSSID(const String& selectedSSID) {
     }
 }
 
-String loadSelectedSSID() {
-    File file = SPIFFS.open("/selectedSSID.json", "r");
-    if (!file) {
-        return String("");
-    }
-
-    StaticJsonDocument<256> doc;
-    DeserializationError error = deserializeJson(doc, file);
-    if (error && verboseDebug) {
-        Serial.println("Failed to parse selected SSID");
-    }
-
-    String selectedSSID = doc["selectedSSID"].as<String>();
-    file.close();
-    if (debugMode && verboseDebug) {
-        Serial.println("Loaded selected SSID: " + selectedSSID);
-    }
-    return selectedSSID;
+String cleanSSID(String ssid) {
+    ssid.trim();
+    int rIndex = ssid.indexOf('\r');
+    if (rIndex != -1) ssid.remove(rIndex);
+    int nIndex = ssid.indexOf('\n');
+    if (nIndex != -1) ssid.remove(nIndex);
+    return ssid;
 }
 
-void handlePortalScreen() {
-    if (debugMode && isPortalRunning) {
-        dnsServer.processNextRequest();
-        server.handleClient();
-        int clientCount = WiFi.softAPgetStationNum();
-        String clientsText = "Clients: " + String(clientCount);
-
-        int16_t clientsTextX = (M5Dial.Display.width() - M5Dial.Display.textWidth(clientsText)) / 2;
-        int16_t clientsTextY = M5Dial.Display.height() / 2 + 30;
-
-        M5Dial.Display.fillRect(0, clientsTextY - 5, M5Dial.Display.width(), M5Dial.Display.fontHeight() + 10, TFT_BLACK);
-        M5Dial.Display.setCursor(clientsTextX, clientsTextY);
-        M5Dial.Display.setTextSize(defaultTextSize);
-        M5Dial.Display.setTextColor(WHITE, BLACK);
-        M5Dial.Display.println(clientsText);
-        drawRing(TFT_BLUE);
-    }
-
-    if (M5Dial.BtnA.wasPressed()) {
-        if (debugMode && isPortalRunning) {
-            stopCaptivePortal();
-        }
-        currentScreen = MENU_SCREEN;
-        drawMenu(currentIndex);
-    }
-}
-
-void drawSSIDMenu(int index) {
-    int count = (int)ssidList.size() + 1; 
-    const char** ssidArray = new const char*[count];
-    for (size_t i = 0; i < ssidList.size(); i++) {
-        ssidArray[i] = ssidList[i].c_str();
-    }
-    ssidArray[count - 1] = "Back";
-
-    drawListMenu(ssidArray, count, index, PURPLE, WHITE, PURPLE);
-    delete[] ssidArray;
-}
-
-void drawRing(uint16_t color) {
-    int16_t centerX = M5Dial.Display.width() / 2;
-    int16_t centerY = M5Dial.Display.height() / 2;
-    int16_t radius = min(M5Dial.Display.width(), M5Dial.Display.height()) / 2;
-
-    for (int16_t r = radius; r > radius - 10; r--) {
-        M5Dial.Display.drawCircle(centerX, centerY, r, color);
-    }
-}
-
-void powerOffDevice() {
-    M5Dial.Display.clear();
-    M5Dial.Display.setTextSize(defaultTextSize);
-    M5Dial.Display.setTextColor(TFT_RED);
-
-    String powerOffText = "Powering off...";
-    int16_t x = (M5Dial.Display.width() - M5Dial.Display.textWidth(powerOffText)) / 2;
-    int16_t y = M5Dial.Display.height() / 2;
-    M5Dial.Display.setCursor(x, y);
-    M5Dial.Display.println(powerOffText);
-
-    if (debugMode && verboseDebug) {
-        Serial.println("Powering off device...");
-    }
-
-    delay(2000);
-    esp_deep_sleep_start();
-}
-
-void adjustBrightness(long newPosition, long& brightnessOldPosition) {
-    long brightnessChange = newPosition - brightnessOldPosition;
-    if (abs(brightnessChange) >= encoderMoveThreshold) {
-        brightnessOldPosition = newPosition; 
-        screenBrightness = constrain(screenBrightness + brightnessChange, 0, 255); 
-        M5Dial.Display.setBrightness(screenBrightness); 
-        if (preferences.begin("settings", false)) {
-            preferences.putInt("brightness", screenBrightness);
-            preferences.end();
-        }
-
-        if (debugMode && verboseDebug) {
-            Serial.printf("Adjusted brightness to: %d\n", screenBrightness);
-        }
-
-        M5Dial.Display.fillRect(0, M5Dial.Display.height()-60, M5Dial.Display.width(), 60, TFT_BLACK);
-        String brightText = "Brightness: " + String(screenBrightness);
-        int16_t x = (M5Dial.Display.width() - M5Dial.Display.textWidth(brightText)) / 2;
-        int16_t y = M5Dial.Display.height() - 50; 
-        M5Dial.Display.setCursor(x, y);
-        M5Dial.Display.setTextColor(WHITE, BLACK);
-        M5Dial.Display.println(brightText);
-    }
-}
-
+// Captive Portal
 void startCaptivePortal() {
     if (debugMode && verboseDebug) {
         Serial.println("Starting Captive Portal...");
@@ -629,6 +583,33 @@ void stopCaptivePortal() {
         }
         WiFi.mode(WIFI_STA);
         delay(500);
+    }
+}
+
+void handlePortalScreen() {
+    if (debugMode && isPortalRunning) {
+        dnsServer.processNextRequest();
+        server.handleClient();
+        int clientCount = WiFi.softAPgetStationNum();
+        String clientsText = "Clients: " + String(clientCount);
+
+        int16_t clientsTextX = (M5Dial.Display.width() - M5Dial.Display.textWidth(clientsText)) / 2;
+        int16_t clientsTextY = M5Dial.Display.height() / 2 + 30;
+
+        M5Dial.Display.fillRect(0, clientsTextY - 5, M5Dial.Display.width(), M5Dial.Display.fontHeight() + 10, TFT_BLACK);
+        M5Dial.Display.setCursor(clientsTextX, clientsTextY);
+        M5Dial.Display.setTextSize(defaultTextSize);
+        M5Dial.Display.setTextColor(WHITE, BLACK);
+        M5Dial.Display.println(clientsText);
+        drawRing(TFT_BLUE);
+    }
+
+    if (M5Dial.BtnA.wasPressed()) {
+        if (debugMode && isPortalRunning) {
+            stopCaptivePortal();
+        }
+        currentScreen = MENU_SCREEN;
+        drawMenu(currentIndex);
     }
 }
 
@@ -713,17 +694,21 @@ void logData(String data) {
     }
 }
 
-String cleanSSID(String ssid) {
-    ssid.trim();
-    int rIndex = ssid.indexOf('\r');
-    if (rIndex != -1) ssid.remove(rIndex);
-    int nIndex = ssid.indexOf('\n');
-    if (nIndex != -1) ssid.remove(nIndex);
-    return ssid;
+// SSID Selection
+void drawSSIDMenu(int index) {
+    int count = (int)ssidList.size() + 1; 
+    const char** ssidArray = new const char*[count];
+    for (size_t i = 0; i < ssidList.size(); i++) {
+        ssidArray[i] = ssidList[i].c_str();
+    }
+    ssidArray[count - 1] = "Back";
+
+    drawListMenu(ssidArray, count, index, PURPLE, WHITE, PURPLE);
+    delete[] ssidArray;
 }
 
 void selectSSID() {
-    if (!debugMode) return; // Only in debug mode (normal mode)
+    if (!debugMode) return; // Only in debug mode
 
     currentScreen = PORTAL_SCREEN;
     delay(200);
@@ -788,313 +773,7 @@ void selectSSID() {
     }
 }
 
-void enterExecuteScriptScreen() {
-  scriptCurrentFileIndex = 0;
-  scriptOldPosition = -999;
-
-  listTxtFiles(SPIFFS, "/");
-  if (!scriptFileNames.empty()) {
-    drawScriptMenu(scriptCurrentFileIndex);
-  } else {
-    M5Dial.Display.clear();
-    drawRing(TFT_RED);
-    M5Dial.Display.setCursor(0, M5Dial.Display.height() / 2 - 10);
-    M5Dial.Display.println("No .txt Files Found");
-  }
-}
-
-void handleExecuteScriptScreen() {
-  long newPosition = M5Dial.Encoder.read();
-  int count = (int)scriptFileNames.size() + 1; // +1 for Back option
-
-  if (abs(newPosition - scriptOldPosition) >= encoderMoveThreshold) {
-    M5Dial.Speaker.tone(8000, 20);
-    scriptOldPosition = newPosition;
-    scriptCurrentFileIndex = (newPosition / encoderMoveThreshold + count) % count;
-    if (scriptCurrentFileIndex < 0) {
-      scriptCurrentFileIndex += count;
-    }
-    drawScriptMenu(scriptCurrentFileIndex);
-  }
-
-  if (M5Dial.BtnA.wasPressed()) {
-    unsigned long pressTime = millis();
-    while (!M5Dial.BtnA.wasReleased()) {
-        M5Dial.update();
-        if (M5Dial.BtnA.pressedFor(1000)) {
-            currentScreen = MENU_SCREEN;
-            drawMenu(currentIndex);
-            return;
-        }
-        delay(10);
-    }
-
-    unsigned long pressDuration = millis() - pressTime;
-
-    if (pressDuration < 1000) {
-        // If Back is selected
-        if (scriptCurrentFileIndex == (int)scriptFileNames.size()) {
-            currentScreen = MENU_SCREEN;
-            drawMenu(currentIndex);
-            return;
-        }
-
-        String selectedFile = scriptFileNames[scriptCurrentFileIndex];
-
-        if (!debugMode) {
-            // HID mode: store and prompt power off
-            if (preferences.begin("settings", false)) {
-              preferences.putString("pendingFile", "/" + selectedFile);
-              preferences.end();
-            }
-            M5Dial.Display.clear();
-            M5Dial.Display.setTextSize(defaultTextSize);
-            M5Dial.Display.setTextColor(TFT_WHITE);
-            String msg = "Script selected: " + selectedFile;
-            int16_t msgX = (M5Dial.Display.width() - M5Dial.Display.textWidth(msg)) / 2;
-            int16_t msgY = M5Dial.Display.height() / 2 - 20;
-            M5Dial.Display.setCursor(msgX, msgY);
-            M5Dial.Display.println(msg);
-
-            String instr = "Script will run on next power on.";
-            int16_t instrX = (M5Dial.Display.width() - M5Dial.Display.textWidth(instr)) / 2;
-            int16_t instrY = msgY + 40;
-            M5Dial.Display.setCursor(instrX, instrY);
-            M5Dial.Display.println(instr);
-
-        } else {
-            // Debug mode: print file contents to Serial
-            M5Dial.Display.clear();
-            M5Dial.Display.setTextSize(defaultTextSize);
-            M5Dial.Display.setTextColor(TFT_WHITE);
-            String msg = "Reading script to Serial: " + selectedFile;
-            int16_t msgX = (M5Dial.Display.width() - M5Dial.Display.textWidth(msg)) / 2;
-            int16_t msgY = M5Dial.Display.height() / 2 - 20;
-            M5Dial.Display.setCursor(msgX, msgY);
-            M5Dial.Display.println(msg);
-
-            String pathToFile = "/" + selectedFile;
-            readFileToSerial(SPIFFS, pathToFile.c_str());
-
-            // After done, remain on script menu
-            drawScriptMenu(scriptCurrentFileIndex);
-        }
-    }
-  }
-
-  if (M5Dial.BtnA.pressedFor(1000)) {
-    currentScreen = MENU_SCREEN;
-    drawMenu(currentIndex);
-  }
-}
-
-void listTxtFiles(fs::FS &fs, const char *dirname) {
-  scriptFileNames.clear(); // Clear previous entries
-  File root = fs.open(dirname);
-  if (!root || !root.isDirectory()) {
-    if (debugMode && verboseDebug) Serial.println("Failed to open directory for txt files");
-    return;
-  }
-  File file = root.openNextFile();
-  while (file) {
-    String fileName = String(file.name());
-    if (fileName.endsWith(".txt")) {
-      if (fileName.startsWith("/")) {
-        fileName = fileName.substring(1);
-      }
-      scriptFileNames.push_back(fileName); // Add to vector
-      if (debugMode && verboseDebug) {
-        Serial.printf("Found .txt file: %s\n", fileName.c_str());
-      }
-    }
-    file.close();
-    file = root.openNextFile();
-  }
-}
-
-void drawScriptMenu(int index) {
-  int count = (int)scriptFileNames.size() + 1; // +1 for Back
-  const char** items = new const char*[count];
-  for (size_t i = 0; i < scriptFileNames.size(); i++) {
-    items[i] = scriptFileNames[i].c_str();
-  }
-  items[count - 1] = "Back";
-
-  drawListMenu(items, count, index, TFT_ORANGE, WHITE, TFT_ORANGE);
-
-  delete[] items;
-}
-
-void readFileToSerial(fs::FS &fs, const char *path) {
-  File file = fs.open(path);
-  if (!file) {
-    M5Dial.Display.drawString("Failed to Open", M5Dial.Display.width() / 2, M5Dial.Display.height() / 2);
-    if (debugMode) {
-      if (verboseDebug) Serial.println("Failed to open script file for reading");
-    }
-    return;
-  }
-  while (file.available()) {
-    char c = file.read();
-    Serial.write(c);
-  }
-  file.close();
-  Serial.println("\nFile read completed.");
-}
-
-void executeKeystrokes(const char *filename) {
-  File file = SPIFFS.open(filename, "r");
-  if (!file) {
-    M5Dial.Display.drawString("Failed to Execute", M5Dial.Display.width() / 2, M5Dial.Display.height() / 2);
-    if (debugMode && verboseDebug) Serial.println("Failed to open script file for HID execution");
-    return;
-  }
-
-  Keyboard.press(KEY_LEFT_GUI);
-  Keyboard.write('r');
-  Keyboard.releaseAll();
-
-  // Wait 3 seconds after Win+R
-  delay(3000);
-
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    line.trim();
-    if (line.startsWith("DELAY")) {
-      int delayTime = line.substring(6).toInt();
-      delay(delayTime);
-    } else if (line.startsWith("STRING")) {
-      String text = line.substring(7);
-      for (int i = 0; i < (int)text.length(); i++) {
-        Keyboard.write(text[i]);
-        delay(10); // faster typing
-      }
-    } else if (line.equals("ENTER")) {
-      Keyboard.write(KEY_RETURN);
-      delay(20);
-    } else if (line.equals("TAB")) {
-      Keyboard.write(KEY_TAB);
-      delay(20);
-    } else if (line.equals("ESC")) {
-      Keyboard.write(KEY_ESC);
-      delay(20);
-    } else if (line.startsWith("CTRL")) {
-      int spaceIndex = line.indexOf(' ');
-      if (spaceIndex != -1 && spaceIndex + 1 < (int)line.length()) {
-        char key = line.charAt(spaceIndex + 1);
-        Keyboard.press(KEY_LEFT_CTRL);
-        Keyboard.write(key);
-        Keyboard.releaseAll();
-        delay(20);
-      }
-    } else if (line.startsWith("ALT")) {
-      int spaceIndex = line.indexOf(' ');
-      if (spaceIndex != -1 && spaceIndex + 1 < (int)line.length()) {
-        char key = line.charAt(spaceIndex + 1);
-        Keyboard.press(KEY_LEFT_ALT);
-        Keyboard.write(key);
-        Keyboard.releaseAll();
-        delay(20);
-      }
-    }
-    // after each line
-    delay(50);
-  }
-  file.close();
-  M5Dial.Display.drawString("Execution Done", M5Dial.Display.width() / 2, M5Dial.Display.height() / 2);
-  if (debugMode && verboseDebug) {
-    Serial.println("HID Execution completed");
-  }
-}
-
-
-void handleSettingsScreen(long newPosition) {
-    static int settingsIndex = 0;
-    static long settingsOldPosition = -999;
-    static bool adjustingBrightness = false;
-
-    String toggleModeText = debugMode ? "Toggle BadUSB Mode" : "Toggle Normal Mode";
-    const char* settingsItemsDynamic[5] = {
-        "Power Off",
-        "Screen Brightness",
-        toggleModeText.c_str(),
-        verboseDebug ? "Verbose Debug: On" : "Verbose Debug: Off",
-        "Back"
-    };
-
-    long movement = newPosition - settingsOldPosition;
-
-    if (!adjustingBrightness && abs(movement) >= encoderMoveThreshold) {
-        M5Dial.Speaker.tone(8000, 20);
-
-        if (movement > 0) {
-            settingsIndex = (settingsIndex + 1) % 5; 
-        } else if (movement < 0) {
-            settingsIndex = (settingsIndex - 1 + 5) % 5;
-        }
-        settingsOldPosition = newPosition;
-        drawListMenu(settingsItemsDynamic, 5, settingsIndex, PURPLE, WHITE, PURPLE);
-    }
-
-    static unsigned long pressStartTime = 0;
-    static bool isBtnAPressed = false;
-
-    if (M5Dial.BtnA.wasPressed()) {
-        isBtnAPressed = true;
-        pressStartTime = millis();
-    }
-
-    if (isBtnAPressed && M5Dial.BtnA.wasReleased()) {
-        unsigned long pressDuration = millis() - pressStartTime;
-        isBtnAPressed = false;
-
-        if (pressDuration < 1000) {
-            if (settingsIndex == 1) {
-                // Screen Brightness
-                adjustingBrightness = !adjustingBrightness;
-                settingsOldPosition = newPosition;
-                if (!adjustingBrightness) {
-                    drawSettingsMenu(settingsIndex);
-                }
-            } else {
-                adjustingBrightness = false; 
-                switch (settingsIndex) {
-                    case 0: // Power Off
-                        powerOffDevice();
-                        return;
-                    case 2: // Toggle HID/Debug Mode
-                        toggleMode();
-                        return;
-                    case 3: // Verbose Debug
-                        verboseDebug = !verboseDebug;
-                        if (preferences.begin("settings", false)) {
-                            preferences.putBool("verboseDebug", verboseDebug);
-                            preferences.end();
-                        }
-                        if (debugMode && verboseDebug) {
-                            Serial.println(verboseDebug ? "Verbose Debug Enabled" : "Verbose Debug Disabled");
-                        }
-                        drawSettingsMenu(settingsIndex);
-                        break;
-                    case 4: // Back
-                        currentScreen = MENU_SCREEN;
-                        drawMenu(currentIndex);
-                        return;
-                }
-            }
-        } else {
-            // Long press: return to main menu
-            adjustingBrightness = false;
-            currentScreen = MENU_SCREEN;
-            drawMenu(currentIndex);
-        }
-    }
-
-    if (adjustingBrightness) {
-        adjustBrightness(newPosition, settingsOldPosition);
-    }
-}
-
+// Return to main menu
 void returnToMainMenu() {
     drawMenu(currentIndex);
     currentScreen = MENU_SCREEN;
@@ -1104,6 +783,7 @@ void returnToMainMenu() {
     }
 }
 
+// Karma Attack
 void startAutoKarma() {
     if (!debugMode) return; 
     if (isKarmaRunning) {
@@ -1322,4 +1002,372 @@ void displayAPStatus(const char* ssid, unsigned long startTime, int autoKarmaAPD
     int16_t stopTextY = M5Dial.Display.height() - 50;
     M5Dial.Display.setCursor(stopTextX, stopTextY);
     M5Dial.Display.println(stopText);
+}
+
+// Settings
+void powerOffDevice() {
+    M5Dial.Display.clear();
+    M5Dial.Display.setTextSize(defaultTextSize);
+    M5Dial.Display.setTextColor(TFT_RED);
+
+    String powerOffText = "Powering off...";
+    int16_t x = (M5Dial.Display.width() - M5Dial.Display.textWidth(powerOffText)) / 2;
+    int16_t y = M5Dial.Display.height() / 2;
+    M5Dial.Display.setCursor(x, y);
+    M5Dial.Display.println(powerOffText);
+
+    if (debugMode && verboseDebug) {
+        Serial.println("Powering off device...");
+    }
+
+    delay(2000);
+    esp_deep_sleep_start();
+}
+
+void drawSettingsMenu(int index) {
+    String toggleModeText = debugMode ? "Toggle BadUSB Mode" : "Toggle Normal Mode";
+    const char* settingsItemsDynamic[5] = {
+        "Power Off",
+        "Screen Brightness",
+        toggleModeText.c_str(),
+        verboseDebug ? "Verbose Debug: On" : "Verbose Debug: Off",
+        "Back"
+    };
+    drawListMenu(settingsItemsDynamic, settingsItemsCount, index, PURPLE, WHITE, PURPLE);
+}
+
+void adjustBrightness(long newPosition, long &brightnessOldPosition) {
+    long brightnessChange = newPosition - brightnessOldPosition;
+    if (abs(brightnessChange) >= encoderMoveThreshold) {
+        brightnessOldPosition = newPosition; 
+        screenBrightness = constrain(screenBrightness + brightnessChange, 0, 255); 
+        M5Dial.Display.setBrightness(screenBrightness); 
+        if (preferences.begin("settings", false)) {
+            preferences.putInt("brightness", screenBrightness);
+            preferences.end();
+        }
+
+        if (debugMode && verboseDebug) {
+            Serial.printf("Adjusted brightness to: %d\n", screenBrightness);
+        }
+
+        M5Dial.Display.fillRect(0, M5Dial.Display.height()-60, M5Dial.Display.width(), 60, TFT_BLACK);
+        String brightText = "Brightness: " + String(screenBrightness);
+        int16_t x = (M5Dial.Display.width() - M5Dial.Display.textWidth(brightText)) / 2;
+        int16_t y = M5Dial.Display.height() - 50; 
+        M5Dial.Display.setCursor(x, y);
+        M5Dial.Display.setTextColor(WHITE, BLACK);
+        M5Dial.Display.println(brightText);
+    }
+}
+
+void handleSettingsScreen(long newPosition) {
+    static int settingsIndex = 0;
+    static long settingsOldPosition = -999;
+    static bool adjustingBrightness = false;
+
+    String toggleModeText = debugMode ? "Toggle BadUSB Mode" : "Toggle Normal Mode";
+    const char* settingsItemsDynamic[5] = {
+        "Power Off",
+        "Screen Brightness",
+        toggleModeText.c_str(),
+        verboseDebug ? "Verbose Debug: On" : "Verbose Debug: Off",
+        "Back"
+    };
+
+    long movement = newPosition - settingsOldPosition;
+
+    if (!adjustingBrightness && abs(movement) >= encoderMoveThreshold) {
+        M5Dial.Speaker.tone(8000, 20);
+
+        if (movement > 0) {
+            settingsIndex = (settingsIndex + 1) % 5; 
+        } else if (movement < 0) {
+            settingsIndex = (settingsIndex - 1 + 5) % 5;
+        }
+        settingsOldPosition = newPosition;
+        drawListMenu(settingsItemsDynamic, 5, settingsIndex, PURPLE, WHITE, PURPLE);
+    }
+
+    static unsigned long pressStartTime = 0;
+    static bool isBtnAPressed = false;
+
+    if (M5Dial.BtnA.wasPressed()) {
+        isBtnAPressed = true;
+        pressStartTime = millis();
+    }
+
+    if (isBtnAPressed && M5Dial.BtnA.wasReleased()) {
+        unsigned long pressDuration = millis() - pressStartTime;
+        isBtnAPressed = false;
+
+        if (pressDuration < 1000) {
+            if (settingsIndex == 1) {
+                // Screen Brightness
+                adjustingBrightness = !adjustingBrightness;
+                settingsOldPosition = newPosition;
+                if (!adjustingBrightness) {
+                    drawSettingsMenu(settingsIndex);
+                }
+            } else {
+                adjustingBrightness = false; 
+                switch (settingsIndex) {
+                    case 0: // Power Off
+                        powerOffDevice();
+                        return;
+                    case 2: // Toggle HID/Debug Mode
+                        toggleMode();
+                        return;
+                    case 3: // Verbose Debug
+                        verboseDebug = !verboseDebug;
+                        if (preferences.begin("settings", false)) {
+                            preferences.putBool("verboseDebug", verboseDebug);
+                            preferences.end();
+                        }
+                        if (debugMode && verboseDebug) {
+                            Serial.println(verboseDebug ? "Verbose Debug Enabled" : "Verbose Debug Disabled");
+                        }
+                        drawSettingsMenu(settingsIndex);
+                        break;
+                    case 4: // Back
+                        currentScreen = MENU_SCREEN;
+                        drawMenu(currentIndex);
+                        return;
+                }
+            }
+        } else {
+            // Long press: return to main menu
+            adjustingBrightness = false;
+            currentScreen = MENU_SCREEN;
+            drawMenu(currentIndex);
+        }
+    }
+
+    if (adjustingBrightness) {
+        adjustBrightness(newPosition, settingsOldPosition);
+    }
+}
+
+// BadUSB Script Execution
+void enterExecuteScriptScreen() {
+    scriptCurrentFileIndex = 0;
+    scriptOldPosition = -999;
+
+    listTxtFiles(SPIFFS, "/");
+    if (!scriptFileNames.empty()) {
+        drawScriptMenu(scriptCurrentFileIndex);
+    } else {
+        M5Dial.Display.clear();
+        drawRing(TFT_RED);
+        M5Dial.Display.setCursor(0, M5Dial.Display.height() / 2 - 10);
+        M5Dial.Display.println("No .txt Files Found");
+    }
+}
+
+void handleExecuteScriptScreen() {
+    // Read the current encoder position and calculate the current selection index
+    long newPosition = M5Dial.Encoder.read();
+    int count = (int)scriptFileNames.size() + 1; // +1 for the "Back" option
+    int oldIndex = scriptCurrentFileIndex;
+
+    // Handle encoder navigation
+    if (abs(newPosition - scriptOldPosition) >= encoderMoveThreshold) {
+        M5Dial.Speaker.tone(8000, 20);
+        scriptOldPosition = newPosition;
+        scriptCurrentFileIndex = (newPosition / encoderMoveThreshold + count) % count;
+        if (scriptCurrentFileIndex < 0) {
+            scriptCurrentFileIndex += count;
+        }
+
+        // Redraw script menu with updated selection
+        drawScriptMenu(scriptCurrentFileIndex);
+    }
+
+    // Check if the button has been long-pressed to return to the main menu
+    if (M5Dial.BtnA.pressedFor(1000)) {
+        currentScreen = MENU_SCREEN;
+        drawMenu(currentIndex);
+        return;
+    }
+
+    // Handle short press (selection)
+    if (M5Dial.BtnA.wasPressed()) {
+        unsigned long pressTime = millis();
+
+        // Wait until button is released or detect long press
+        while (!M5Dial.BtnA.wasReleased()) {
+            M5Dial.update();
+            if (M5Dial.BtnA.pressedFor(1000)) {
+                // Long press detected, return to the menu
+                currentScreen = MENU_SCREEN;
+                drawMenu(currentIndex);
+                return;
+            }
+            delay(10);
+        }
+
+        // Determine press duration to differentiate between short and long press
+        unsigned long pressDuration = millis() - pressTime;
+        if (pressDuration < 1000) {
+            // Short press: either select a script or go back
+            if (scriptCurrentFileIndex == (int)scriptFileNames.size()) {
+                // "Back" selected
+                currentScreen = MENU_SCREEN;
+                drawMenu(currentIndex);
+                return;
+            }
+
+            // A script file was selected
+            String selectedFile = scriptFileNames[scriptCurrentFileIndex];
+
+            // Clear the display and draw a visual accent ring
+            M5Dial.Display.clear();
+            drawRing(TFT_ORANGE);
+            M5Dial.Display.setTextSize(defaultTextSize);
+            M5Dial.Display.setTextColor(TFT_WHITE);
+
+            if (!debugMode) {
+                // HID mode: Store script for next power-on execution
+                if (preferences.begin("settings", false)) {
+                    preferences.putString("pendingFile", "/" + selectedFile);
+                    preferences.end();
+                }
+
+                // Show confirmation message
+                String msg1 = "Script selected:";
+                centerText(msg1, -40); 
+                String msg2 = selectedFile;
+                centerText(msg2, -20);
+                centerText("Will run on next power on.", 40);
+
+            } else {
+                String msg1 = "Script selected:";
+                centerText(msg1, -40);
+                String msg2 = selectedFile;
+                centerText(msg2, -20);
+                String pathToFile = "/" + selectedFile;
+                readFileToSerial(SPIFFS, pathToFile.c_str());
+                delay(2000);
+                drawScriptMenu(scriptCurrentFileIndex);
+            }
+        }
+    }
+}
+
+void listTxtFiles(fs::FS &fs, const char *dirname) {
+    scriptFileNames.clear();
+    File root = fs.open(dirname);
+    if (!root || !root.isDirectory()) {
+        if (debugMode && verboseDebug) Serial.println("Failed to open directory for txt files");
+        return;
+    }
+    File file = root.openNextFile();
+    while (file) {
+        String fileName = String(file.name());
+        if (fileName.endsWith(".txt")) {
+            if (fileName.startsWith("/")) {
+                fileName = fileName.substring(1);
+            }
+            scriptFileNames.push_back(fileName);
+            if (debugMode && verboseDebug) {
+                Serial.printf("Found .txt file: %s\n", fileName.c_str());
+            }
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+}
+
+void drawScriptMenu(int index) {
+    int count = (int)scriptFileNames.size() + 1; // +1 for Back
+    const char** items = new const char*[count];
+    for (size_t i = 0; i < scriptFileNames.size(); i++) {
+        items[i] = scriptFileNames[i].c_str();
+    }
+    items[count - 1] = "Back";
+
+    drawListMenu(items, count, index, TFT_ORANGE, WHITE, TFT_ORANGE);
+    delete[] items;
+}
+
+void readFileToSerial(fs::FS &fs, const char *path) {
+    File file = fs.open(path);
+    if (!file) {
+        M5Dial.Display.drawString("Failed to Open", M5Dial.Display.width() / 2, M5Dial.Display.height() / 2);
+        if (debugMode && verboseDebug) {
+            Serial.println("Failed to open script file for reading");
+        }
+        return;
+    }
+    while (file.available()) {
+        char c = file.read();
+        Serial.write(c);
+    }
+    file.close();
+    Serial.println("\nFile read completed.");
+}
+
+void executeKeystrokes(const char *filename) {
+    File file = SPIFFS.open(filename, "r");
+    if (!file) {
+        M5Dial.Display.drawString("Failed to Execute", M5Dial.Display.width() / 2, M5Dial.Display.height() / 2);
+        if (debugMode && verboseDebug) Serial.println("Failed to open script file for BadUSB execution");
+        return;
+    }
+
+    Keyboard.press(KEY_LEFT_GUI);
+    Keyboard.write('r');
+    Keyboard.releaseAll();
+
+    // Wait 3 seconds after Win+R
+    delay(3000);
+
+    while (file.available()) {
+        String line = file.readStringUntil('\n');
+        line.trim();
+        if (line.startsWith("DELAY")) {
+            int delayTime = line.substring(6).toInt();
+            delay(delayTime);
+        } else if (line.startsWith("STRING")) {
+            String text = line.substring(7);
+            for (int i = 0; i < (int)text.length(); i++) {
+                Keyboard.write(text[i]);
+                delay(10);
+            }
+        } else if (line.equals("ENTER")) {
+            Keyboard.write(KEY_RETURN);
+            delay(20);
+        } else if (line.equals("TAB")) {
+            Keyboard.write(KEY_TAB);
+            delay(20);
+        } else if (line.equals("ESC")) {
+            Keyboard.write(KEY_ESC);
+            delay(20);
+        } else if (line.startsWith("CTRL")) {
+            int spaceIndex = line.indexOf(' ');
+            if (spaceIndex != -1 && spaceIndex + 1 < (int)line.length()) {
+                char key = line.charAt(spaceIndex + 1);
+                Keyboard.press(KEY_LEFT_CTRL);
+                Keyboard.write(key);
+                Keyboard.releaseAll();
+                delay(20);
+            }
+        } else if (line.startsWith("ALT")) {
+            int spaceIndex = line.indexOf(' ');
+            if (spaceIndex != -1 && spaceIndex + 1 < (int)line.length()) {
+                char key = line.charAt(spaceIndex + 1);
+                Keyboard.press(KEY_LEFT_ALT);
+                Keyboard.write(key);
+                Keyboard.releaseAll();
+                delay(20);
+            }
+        }
+        // after each line
+        delay(50);
+    }
+    file.close();
+    M5Dial.Display.drawString("Execution Done", M5Dial.Display.width() / 2, M5Dial.Display.height() / 2);
+    if (debugMode && verboseDebug) {
+        Serial.println("BadUSB Execution completed");
+    }
 }
